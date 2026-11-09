@@ -167,8 +167,6 @@ public class GuardNPCController : MonoBehaviour
     private const float AllySupportDuration = 8.0f;
     private const float AllySupportVolleyInterval = 0.6f;
     private const float AllyNormalVolleyInterval = 1.25f;
-    // Safety cap while waiting for an in-flight AI decision before auto-reloading an empty magazine
-    private const float AutoReloadAiWaitTimeout = 28.0f;
 
     // Snapshot fields for event-driven decision triggers
     private NpcRole prevNpcRole;
@@ -784,23 +782,20 @@ public class GuardNPCController : MonoBehaviour
             return;
         }
 
-        // Role-specific auto-reload speed (ASSAULT reloads faster in 0.65s; GUARD/SCOUT in 1.1s).
-        // While an AI decision is in flight/queued, give the LLM time to choose RELOAD itself; auto-reload is only a fallback.
+        // Role-specific auto-reload speed (ASSAULT reloads faster in 0.65s; GUARD/SCOUT in 1.1s)
         if (state.ammo <= 0)
         {
             guardAttackFireTimer = 0f;
+            if (!IsRecoveringInCover() && state.currentAction != "RETREAT" && state.currentAction != "RELOAD")
+            {
+                state.currentAction = "RELOAD";
+                SetNpcColor(new Color(0.15f, 0.85f, 0.85f));
+            }
             autoReloadTimer += Time.deltaTime;
-            bool aiBusy = isWaitingForDecision || pendingDecisionRequest;
-            float reloadDelay = aiBusy
-                ? AutoReloadAiWaitTimeout
-                : ((npcRole == NpcRole.ASSAULT) ? 0.65f : 1.1f);
+            float reloadDelay = (npcRole == NpcRole.ASSAULT) ? 0.65f : 1.1f;
             if (autoReloadTimer >= reloadDelay)
             {
                 autoReloadTimer = 0f;
-                if (aiBusy)
-                {
-                    Debug.Log($"[Combat] AI did not choose RELOAD within {AutoReloadAiWaitTimeout:F0}s -> deterministic auto-reload fallback.");
-                }
                 ExecuteAction("RELOAD");
             }
             return;
@@ -830,6 +825,14 @@ public class GuardNPCController : MonoBehaviour
     private void FireGuardShotAtEnemy()
     {
         if (state.ammo <= 0 || state.enemyCount <= 0) return;
+
+        // If the Guard just finished reloading, return to ATTACK posture when firing resumes
+        if (state.currentAction == "RELOAD" && !IsRecoveringInCover())
+        {
+            state.currentAction = "ATTACK";
+            SetNpcColor(GetRoleAttackColor());
+            targetPosition = GetGuardAttackTargetPosition(GetNearestActiveEnemyPosition());
+        }
 
         bool hadAmmo = state.ammo > 0;
         state.ammo--;
@@ -882,6 +885,18 @@ public class GuardNPCController : MonoBehaviour
         }
 
         Debug.Log($"[Combat] {state.npcId} ({state.role}) fired ({GetRoleWeaponProfileLabel()}) at Enemy #{targetEnemyIdx + 1}! Remaining Ammo: {state.ammo}/{maxAmmo}");
+
+        // Immediately exit ATTACK and enter RELOAD posture the moment the last round is fired
+        if (state.ammo <= 0)
+        {
+            guardAttackFireTimer = 0f;
+            autoReloadTimer = 0f;
+            if (!IsRecoveringInCover() && state.currentAction != "RETREAT")
+            {
+                state.currentAction = "RELOAD";
+                SetNpcColor(new Color(0.15f, 0.85f, 0.85f));
+            }
+        }
 
         // Keep prevAmmo synced unless ammo just hit 0 (so the ammo-depleted event trigger fires immediately at 0)
         if (!(hadAmmo && state.ammo == 0))
@@ -2033,6 +2048,7 @@ public class GuardNPCController : MonoBehaviour
         state.role = npcRole.ToString();
         state.stateVersion = requestVersion;
         List<string> legalActionsAtRequest = GenerateLegalActions();
+        int ammoAtRequest = state.ammo;
         // Remember which Ally help call (if any) this request delivers to the LLM
         int helpIdAtRequest = state.allyNeedsHelp ? allyHelpRequestId : -1;
 
@@ -2122,31 +2138,17 @@ public class GuardNPCController : MonoBehaviour
             // Validate Decision & Handle Stale StateVersions
             List<string> currentLegalActions = GenerateLegalActions();
             bool isStale = (response.stateVersion != currentStateVersion);
-            bool isLegalNow = !string.IsNullOrEmpty(response.action) && currentLegalActions.Contains(response.action);
+            bool isLegalNow = !string.IsNullOrEmpty(response.action) &&
+                              (currentLegalActions.Contains(response.action) ||
+                               (response.action == "RELOAD" && ammoAtRequest <= 0));
             // If a stale decision arrives while the Guard is wounded and recovering in cover, do not let a stale ATTACK/RETREAT/HOLD pull it out of cover
             if (isStale && IsRecoveringInCover() &&
                 (response.action == "ATTACK" || response.action == "RETREAT" || response.action == "HOLD_POSITION"))
             {
                 isLegalNow = false;
             }
-            // The LLM chose RELOAD for an empty magazine, but the auto-reload fallback already refilled it while waiting
-            bool reloadAlreadyDone = response.action == "RELOAD" && state.ammo >= maxAmmo;
 
-            if (reloadAlreadyDone)
-            {
-                LogDecision(
-                    response.stateVersion,
-                    currentLegalActions,
-                    response.toolsCalled,
-                    response.action,
-                    response.confidence,
-                    response.reason + " [Magazine already refilled by the auto-reload fallback; no extra action needed]",
-                    response.latencyMs,
-                    "ALREADY SATISFIED",
-                    state.currentAction
-                );
-            }
-            else if (isStale && !isLegalNow)
+            if (isStale && !isLegalNow)
             {
                 string fallback = GetLegalFallbackAction(currentLegalActions);
                 LogDecision(
@@ -2338,6 +2340,7 @@ public class GuardNPCController : MonoBehaviour
         SetNpcColor(new Color(0.15f, 0.85f, 0.85f));
         state.ammo = maxAmmo;
         prevAmmo = state.ammo;
+        guardAttackFireTimer = 0f;
         if (IsRecoveringInCover())
         {
             targetPosition = GetCoverShelterPosition();
@@ -2499,8 +2502,9 @@ public class GuardNPCController : MonoBehaviour
         }
         else if (ammo == 0)
         {
-            // Do NOT reload instantly: the LLM must see ammo=0 and choose RELOAD itself (auto-reload is only a delayed fallback)
-            ExecuteAction("HOLD_POSITION");
+            // Enter RELOAD posture immediately with 0 ammo so HUD shows RELOAD while the LLM also receives ammo=0
+            state.currentAction = "RELOAD";
+            SetNpcColor(new Color(0.15f, 0.85f, 0.85f));
         }
         else if (!cover && enemies >= 3)
         {
