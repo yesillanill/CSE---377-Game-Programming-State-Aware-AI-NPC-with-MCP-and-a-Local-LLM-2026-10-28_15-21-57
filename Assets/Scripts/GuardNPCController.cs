@@ -723,6 +723,13 @@ public class GuardNPCController : MonoBehaviour
     {
         if (!Application.isPlaying || state.enemyCount <= 0) return;
 
+        // If the Guard is currently moving to cover or healing in cover, keep it heading to the cover shelter
+        if (IsRecoveringInCover())
+        {
+            targetPosition = GetCoverShelterPosition();
+            return;
+        }
+
         // If the NPC is currently attacking (or in the open), immediately reposition to the new role's attack zone
         if (state.currentAction == "ATTACK" || !IsPhysicallyInCoverPocket())
         {
@@ -1076,7 +1083,7 @@ public class GuardNPCController : MonoBehaviour
     // Damage System: reduces health (clamped >= 0) and triggers an immediate tactical decision on critical/major health change
     public void TakeDamage(float amount)
     {
-        if (amount <= 0f || state.health <= 0f) return;
+        if (amount <= 0f) return;
 
         float oldHealth = state.health;
         state.health = Mathf.Max(0f, state.health - amount);
@@ -1088,7 +1095,8 @@ public class GuardNPCController : MonoBehaviour
                                    (oldHealth > 25f && state.health <= 25f);
         bool manualBurstDrop = amount >= 15f;
 
-        if ((crossedLowThreshold || manualBurstDrop) && state.health <= roleCoverThreshold && state.coverAvailable && !IsPhysicallyInCoverPocket())
+        // Always move to cover when health is at/below the role's cover threshold and cover is available
+        if (state.health <= roleCoverThreshold && state.coverAvailable)
         {
             ExecuteAction("TAKE_COVER");
         }
@@ -1206,6 +1214,16 @@ public class GuardNPCController : MonoBehaviour
         return Vector2.Distance(new Vector2(transform.position.x, transform.position.z), new Vector2(shelterPos.x, shelterPos.z)) <= 1.15f;
     }
 
+    // True while the Guard has taken cover (or is physically in cover) and is still healing toward its role's exit-cover threshold
+    private bool IsRecoveringInCover()
+    {
+        if (!state.coverAvailable) return false;
+        if (state.health >= GetRoleExitCoverThreshold()) return false;
+        bool inCoverPosture = state.currentAction == "TAKE_COVER" ||
+                              (state.currentAction == "CALL_FOR_HELP" && IsPhysicallyInCoverPocket());
+        return inCoverPosture || IsPhysicallyInCoverPocket();
+    }
+
     private void UpdateEnemyDamage()
     {
         if (state.health <= 0f || state.enemyCount <= 0)
@@ -1311,7 +1329,7 @@ public class GuardNPCController : MonoBehaviour
     {
         bool inCoverPocket = IsPhysicallyInCoverPocket();
 
-        if (inCoverPocket && state.health > 0f)
+        if (inCoverPocket)
         {
             timeSpentInCover += Time.deltaTime;
 
@@ -1322,10 +1340,12 @@ public class GuardNPCController : MonoBehaviour
                 CallForHelp();
             }
 
-            // 2. Recover health while sheltered behind cover
+            // 2. Recover health while sheltered behind cover (including if health was reduced all the way to 0 via H)
             if (state.health < 90f)
             {
-                state.health = Mathf.Min(90f, state.health + coverHealRatePerSecond * Time.deltaTime);
+                float healRate = Mathf.Max(12.0f, coverHealRatePerSecond);
+                state.health = Mathf.Min(90f, state.health + healRate * Time.deltaTime);
+                prevHealth = state.health;
             }
 
             // 3. Role-specific cover exit threshold (ASSAULT exits at >= 60 HP after 1.6s, GUARD at >= 75 HP, SCOUT at >= 82 HP)
@@ -1631,11 +1651,15 @@ public class GuardNPCController : MonoBehaviour
         SyncSceneUnitsVisuals();
         activeScenarioLabel = $"Cooperation Alert (Ally '{callerId}' Needs Help)";
 
-        // A wounded Guard (health at/below its role's cover threshold) does NOT run into the open; the LLM decides instead
+        // A wounded Guard (health at/below its role's cover threshold or still healing in cover) does NOT run into the open
         float roleCoverThreshold = GetRoleEnterCoverThreshold();
-        if (state.health <= roleCoverThreshold)
+        if (state.health <= roleCoverThreshold || IsRecoveringInCover())
         {
-            Debug.Log($"[AI Cooperation] {state.npcId} ({state.role}) is too wounded to rescue '{callerId}' ({state.health:F0} HP <= {roleCoverThreshold:F0}) -> keeping '{state.currentAction}' and asking the AI.");
+            if (state.coverAvailable)
+            {
+                targetPosition = GetCoverShelterPosition();
+            }
+            Debug.Log($"[AI Cooperation] {state.npcId} ({state.role}) is recovering in cover ({state.health:F0} HP) -> staying in cover and asking the AI.");
         }
         else if (state.ammo > 0 && state.enemyCount > 0)
         {
@@ -2099,6 +2123,12 @@ public class GuardNPCController : MonoBehaviour
             List<string> currentLegalActions = GenerateLegalActions();
             bool isStale = (response.stateVersion != currentStateVersion);
             bool isLegalNow = !string.IsNullOrEmpty(response.action) && currentLegalActions.Contains(response.action);
+            // If a stale decision arrives while the Guard is wounded and recovering in cover, do not let a stale ATTACK/RETREAT/HOLD pull it out of cover
+            if (isStale && IsRecoveringInCover() &&
+                (response.action == "ATTACK" || response.action == "RETREAT" || response.action == "HOLD_POSITION"))
+            {
+                isLegalNow = false;
+            }
             // The LLM chose RELOAD for an empty magazine, but the auto-reload fallback already refilled it while waiting
             bool reloadAlreadyDone = response.action == "RELOAD" && state.ammo >= maxAmmo;
 
@@ -2198,6 +2228,12 @@ public class GuardNPCController : MonoBehaviour
         {
             action = "ATTACK";
         }
+        // Keep the Guard in cover until health regenerates to the role's exit threshold (prevents premature ATTACK/RETREAT from cancelling cover healing)
+        else if (IsRecoveringInCover() &&
+                 (action == "ATTACK" || action == "RETREAT" || action == "HOLD_POSITION"))
+        {
+            action = "TAKE_COVER";
+        }
 
         state.currentAction = action;
 
@@ -2287,7 +2323,7 @@ public class GuardNPCController : MonoBehaviour
         SyncSceneUnitsVisuals();
 
         // Keep Guard in cover while calling the existing Ally for help
-        if (state.coverAvailable && (IsPhysicallyInCoverPocket() || Vector3.Distance(targetPosition, GetCoverShelterPosition()) < 0.5f))
+        if (state.coverAvailable && (IsRecoveringInCover() || IsPhysicallyInCoverPocket() || Vector3.Distance(targetPosition, GetCoverShelterPosition()) < 0.5f))
         {
             targetPosition = GetCoverShelterPosition();
         }
@@ -2302,6 +2338,10 @@ public class GuardNPCController : MonoBehaviour
         SetNpcColor(new Color(0.15f, 0.85f, 0.85f));
         state.ammo = maxAmmo;
         prevAmmo = state.ammo;
+        if (IsRecoveringInCover())
+        {
+            targetPosition = GetCoverShelterPosition();
+        }
         Debug.Log($"[Combat] {state.npcId} ({state.role}) reloaded magazine: {state.ammo}/{maxAmmo}");
     }
 
