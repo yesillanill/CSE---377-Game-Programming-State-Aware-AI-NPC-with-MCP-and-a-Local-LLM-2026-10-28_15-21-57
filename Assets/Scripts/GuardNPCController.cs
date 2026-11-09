@@ -161,6 +161,15 @@ public class GuardNPCController : MonoBehaviour
     private float allyCombatFireTimer = 0f;
     private int roleStrafeDirection = 1;
 
+    // Cooperation tracking: each Ally help call gets an id so allyNeedsHelp stays true until the LLM has seen it
+    private int allyHelpRequestId = 0;
+    private int distressedAllyIndex = -1;
+    private const float AllySupportDuration = 8.0f;
+    private const float AllySupportVolleyInterval = 0.6f;
+    private const float AllyNormalVolleyInterval = 1.25f;
+    // Safety cap while waiting for an in-flight AI decision before auto-reloading an empty magazine
+    private const float AutoReloadAiWaitTimeout = 28.0f;
+
     // Snapshot fields for event-driven decision triggers
     private NpcRole prevNpcRole;
     private float prevHealth;
@@ -327,8 +336,10 @@ public class GuardNPCController : MonoBehaviour
             for (int j = 0; j < children.Length; j++)
             {
                 Transform tr = children[j];
+                // Skip UI elements (e.g., the HUD's "AllyHelpButton") so they are never treated as Ally units
                 if (tr != null && tr.gameObject != gameObject &&
                     tr.name.StartsWith("Ally", StringComparison.OrdinalIgnoreCase) &&
+                    !(tr is RectTransform) && tr.GetComponentInParent<Canvas>(true) == null &&
                     !existingSceneAllies.Contains(tr))
                 {
                     existingSceneAllies.Add(tr);
@@ -716,7 +727,7 @@ public class GuardNPCController : MonoBehaviour
         if (state.currentAction == "ATTACK" || !IsPhysicallyInCoverPocket())
         {
             SetNpcColor(GetRoleAttackColor());
-            targetPosition = GetRoleAttackPosition(GetNearestActiveEnemyPosition());
+            targetPosition = GetGuardAttackTargetPosition(GetNearestActiveEnemyPosition());
         }
     }
 
@@ -766,15 +777,23 @@ public class GuardNPCController : MonoBehaviour
             return;
         }
 
-        // Role-specific auto-reload speed (ASSAULT reloads faster in 0.65s; GUARD/SCOUT in 1.1s)
+        // Role-specific auto-reload speed (ASSAULT reloads faster in 0.65s; GUARD/SCOUT in 1.1s).
+        // While an AI decision is in flight/queued, give the LLM time to choose RELOAD itself; auto-reload is only a fallback.
         if (state.ammo <= 0)
         {
             guardAttackFireTimer = 0f;
             autoReloadTimer += Time.deltaTime;
-            float reloadDelay = (npcRole == NpcRole.ASSAULT) ? 0.65f : 1.1f;
+            bool aiBusy = isWaitingForDecision || pendingDecisionRequest;
+            float reloadDelay = aiBusy
+                ? AutoReloadAiWaitTimeout
+                : ((npcRole == NpcRole.ASSAULT) ? 0.65f : 1.1f);
             if (autoReloadTimer >= reloadDelay)
             {
                 autoReloadTimer = 0f;
+                if (aiBusy)
+                {
+                    Debug.Log($"[Combat] AI did not choose RELOAD within {AutoReloadAiWaitTimeout:F0}s -> deterministic auto-reload fallback.");
+                }
                 ExecuteAction("RELOAD");
             }
             return;
@@ -825,7 +844,7 @@ public class GuardNPCController : MonoBehaviour
             roleStrafeDirection = -roleStrafeDirection;
             if (state.currentAction == "ATTACK")
             {
-                targetPosition = GetRoleAttackPosition(enemyPos);
+                targetPosition = GetGuardAttackTargetPosition(enemyPos);
             }
         }
         else if (npcRole == NpcRole.ASSAULT)
@@ -842,7 +861,7 @@ public class GuardNPCController : MonoBehaviour
             roleStrafeDirection = -roleStrafeDirection;
             if (state.currentAction == "ATTACK")
             {
-                targetPosition = GetRoleAttackPosition(enemyPos);
+                targetPosition = GetGuardAttackTargetPosition(enemyPos);
             }
         }
         else
@@ -1014,16 +1033,27 @@ public class GuardNPCController : MonoBehaviour
         allyHealths[index] = Mathf.Max(10f, allyHealths[index] - amount);
         Debug.Log($"[Ally Damage] Ally #{index + 1} took {amount:F0} damage: {oldHp:F0} -> {allyHealths[index]:F0} HP");
 
-        // When Ally health drops low (<= 40 HP) and cover is available, Ally moves into cover and calls Guard for help!
-        if (allyHealths[index] <= 40f && state.coverAvailable && !allyInCoverFlags[index])
+        // When Ally health drops low (<= 40 HP), Ally moves into cover (if available) and calls Guard for help!
+        if (allyHealths[index] <= 40f)
         {
-            allyInCoverFlags[index] = true;
-            allyCoverTimers[index] = 0f;
-            Vector3 allyPos = (index < existingSceneAllies.Count && existingSceneAllies[index] != null)
-                ? existingSceneAllies[index].position
-                : initialAllyPosition;
-            Debug.Log($"[Ally Tactical Cover] Ally #{index + 1} health is low ({allyHealths[index]:F0} HP) -> moving behind CoverCubeEast and calling Guard for help!");
-            OnCallForHelpTriggered?.Invoke("ally_01", allyPos);
+            if (state.coverAvailable && !allyInCoverFlags[index])
+            {
+                allyInCoverFlags[index] = true;
+                allyCoverTimers[index] = 0f;
+                Vector3 allyPos = (index < existingSceneAllies.Count && existingSceneAllies[index] != null)
+                    ? existingSceneAllies[index].position
+                    : initialAllyPosition;
+                Debug.Log($"[Ally Tactical Cover] Ally #{index + 1} health is low ({allyHealths[index]:F0} HP) -> moving behind cover and calling Guard for help!");
+                OnCallForHelpTriggered?.Invoke($"ally_0{index + 1}", allyPos);
+            }
+            else if (!state.coverAvailable && oldHp > 40f)
+            {
+                Vector3 allyPos = (index < existingSceneAllies.Count && existingSceneAllies[index] != null)
+                    ? existingSceneAllies[index].position
+                    : initialAllyPosition;
+                Debug.Log($"[Ally Distress] Ally #{index + 1} health dropped low ({allyHealths[index]:F0} HP) with no cover available -> calling Guard for help!");
+                OnCallForHelpTriggered?.Invoke($"ally_0{index + 1}", allyPos);
+            }
         }
     }
 
@@ -1258,10 +1288,9 @@ public class GuardNPCController : MonoBehaviour
 
                     if (IsAllyPhysicallyInCover(i))
                     {
-                        if (eastCoverTransform != null && eastCoverTransform.gameObject.activeInHierarchy)
-                        {
-                            SpawnVisualBullet(enemyPos, eastCoverTransform.position, new Color(0.95f, 0.25f, 0.20f));
-                        }
+                        // Shot hits the cover cube this Ally is hiding behind (Ally #1 -> CoverCubeEast, Ally #2 -> CoverCube)
+                        Vector3 shelter = GetAllyCoverShelterPosition(i);
+                        SpawnVisualBullet(enemyPos, new Vector3(shelter.x, 0.5f, shelter.z + 1.05f), new Color(0.95f, 0.25f, 0.20f));
                     }
                     else
                     {
@@ -1332,10 +1361,94 @@ public class GuardNPCController : MonoBehaviour
             if (allyDistressTimer >= allyAutoHelpRequestInterval)
             {
                 allyDistressTimer = 0f;
-                Vector3 allyPos = GetActiveAllyPosition();
-                Debug.Log($"[AI Cooperation] Existing scene Ally is under enemy fire at {allyPos} and calling Guard '{state.npcId}' for help!");
-                OnCallForHelpTriggered?.Invoke("ally_01", allyPos);
+                int callerIdx = GetMostWoundedActiveAllyIndex();
+                Vector3 allyPos = GetAllyPositionOrDefault(callerIdx);
+                Debug.Log($"[AI Cooperation] Ally #{callerIdx + 1} is under enemy fire at {allyPos} and calling Guard '{state.npcId}' for help!");
+                OnCallForHelpTriggered?.Invoke($"ally_0{callerIdx + 1}", allyPos);
             }
+        }
+    }
+
+    // Returns the active Ally with the lowest health (defaults to index 0)
+    private int GetMostWoundedActiveAllyIndex()
+    {
+        EnsureUnitHealthListsSynced();
+        int best = 0;
+        float bestHp = float.MaxValue;
+        int activeCount = Mathf.Clamp(state.nearbyAllies, 0, Mathf.Min(existingSceneAllies.Count, allyHealths.Count));
+        for (int i = 0; i < activeCount; i++)
+        {
+            Transform ally = existingSceneAllies[i];
+            if (ally == null || !ally.gameObject.activeInHierarchy) continue;
+            if (allyHealths[i] < bestHp)
+            {
+                bestHp = allyHealths[i];
+                best = i;
+            }
+        }
+        return best;
+    }
+
+    private Vector3 GetAllyPositionOrDefault(int index)
+    {
+        if (index >= 0 && index < existingSceneAllies.Count && existingSceneAllies[index] != null)
+        {
+            return existingSceneAllies[index].position;
+        }
+        return GetActiveAllyPosition();
+    }
+
+    // Parses "ally_02" -> 1; returns -1 for non-Ally callers (e.g., other Guard NPCs)
+    private static int ParseAllyIndex(string callerId)
+    {
+        if (!string.IsNullOrEmpty(callerId) &&
+            callerId.StartsWith("ally_", StringComparison.OrdinalIgnoreCase) &&
+            int.TryParse(callerId.Substring(5), out int number) && number > 0)
+        {
+            return number - 1;
+        }
+        return -1;
+    }
+
+    // Live position of the Ally that requested help (falls back to the position captured when the call was made)
+    private Vector3 GetDistressedAllyPosition()
+    {
+        if (distressedAllyIndex >= 0 && distressedAllyIndex < existingSceneAllies.Count &&
+            existingSceneAllies[distressedAllyIndex] != null &&
+            existingSceneAllies[distressedAllyIndex].gameObject.activeInHierarchy)
+        {
+            return existingSceneAllies[distressedAllyIndex].position;
+        }
+        return distressedAllyPosition;
+    }
+
+    // Forward support position used while CALL_FOR_HELP support is active:
+    // Allies advance through the central corridor (between CoverCube x<=-1.9 and CoverCubeEast x>=1.9) to z=+2.35 to suppress Enemies
+    private Vector3 GetAllySupportPosition(int index)
+    {
+        if (index == 0) return new Vector3(1.45f, 1.0f, 2.35f);
+        if (index == 1) return new Vector3(-1.45f, 1.0f, 2.35f);
+        float side = (index % 2 == 0) ? 1.45f : -1.45f;
+        return new Vector3(Mathf.Clamp(side, -1.75f, 1.75f), 1.0f, 2.35f);
+    }
+
+    // Clears the cooperation flag (used once the LLM has received the request, or on scenario/reset)
+    private void ClearAllyHelpRequest(string reason)
+    {
+        if (!state.allyNeedsHelp && distressedAllyIndex < 0) return;
+        state.allyNeedsHelp = false;
+        prevAllyNeedsHelp = false;
+        distressedAllyIndex = -1;
+        SyncSceneUnitsVisuals();
+        Debug.Log($"[AI Cooperation] Ally help request cleared ({reason}).");
+    }
+
+    // Clears allyNeedsHelp only if the request that just completed carried this exact help call to the LLM
+    private void AcknowledgeAllyHelpRequest(int helpIdAtRequest)
+    {
+        if (helpIdAtRequest >= 0 && helpIdAtRequest == allyHelpRequestId && state.allyNeedsHelp)
+        {
+            ClearAllyHelpRequest($"help request #{helpIdAtRequest} was delivered to the AI decision");
         }
     }
 
@@ -1359,15 +1472,26 @@ public class GuardNPCController : MonoBehaviour
 
         if (allySupportMoveTimer > 0f)
         {
-            allySupportMoveTimer -= Time.deltaTime;
+            allySupportMoveTimer = Mathf.Max(0f, allySupportMoveTimer - Time.deltaTime);
         }
 
-        allyCombatFireTimer += Time.deltaTime;
+        // CALL_FOR_HELP support: Allies advance next to the Guard and fire at a faster cadence while the timer is active
+        bool supportActive = allySupportMoveTimer > 0f;
+        float volleyInterval = supportActive ? AllySupportVolleyInterval : AllyNormalVolleyInterval;
+
         bool fireVolleyNow = false;
-        if (state.enemyCount > 0 && allyCombatFireTimer >= 1.25f)
+        if (state.enemyCount > 0)
         {
-            allyCombatFireTimer -= 1.25f;
-            fireVolleyNow = true;
+            allyCombatFireTimer += Time.deltaTime;
+            if (allyCombatFireTimer >= volleyInterval)
+            {
+                allyCombatFireTimer -= volleyInterval;
+                fireVolleyNow = true;
+            }
+        }
+        else
+        {
+            allyCombatFireTimer = 0f;
         }
 
         int targetEnemyIdx = GetBestTargetEnemyIndex();
@@ -1416,8 +1540,8 @@ public class GuardNPCController : MonoBehaviour
             }
             else if (state.enemyCount > 0)
             {
-                // Active combat position in the open firing lane
-                desiredAllyPos = GetAllyOpenCombatPosition(i);
+                // Active combat position in the open firing lane (or forward next to the Guard while supporting it)
+                desiredAllyPos = supportActive ? GetAllySupportPosition(i) : GetAllyOpenCombatPosition(i);
 
                 if (fireVolleyNow)
                 {
@@ -1434,7 +1558,7 @@ public class GuardNPCController : MonoBehaviour
             }
             else
             {
-                desiredAllyPos = initialAllyPosition;
+                desiredAllyPos = (i < initialAllyPositions.Count) ? initialAllyPositions[i] : initialAllyPosition;
             }
 
             ally.position = Vector3.MoveTowards(ally.position, desiredAllyPos, (moveSpeed * 0.92f) * Time.deltaTime);
@@ -1498,14 +1622,26 @@ public class GuardNPCController : MonoBehaviour
     {
         if (callerId == state.npcId) return;
 
+        // New help call id: allyNeedsHelp stays true until a decision request carrying it has completed
+        allyHelpRequestId++;
         state.allyNeedsHelp = true;
         prevAllyNeedsHelp = true;
+        distressedAllyIndex = ParseAllyIndex(callerId);
         distressedAllyPosition = callerPosition;
         SyncSceneUnitsVisuals();
         activeScenarioLabel = $"Cooperation Alert (Ally '{callerId}' Needs Help)";
 
-        // Immediately move the Guard out to rescue the existing Ally and fire at the Enemy!
-        ExecuteAction("ATTACK");
+        // A wounded Guard (health at/below its role's cover threshold) does NOT run into the open; the LLM decides instead
+        float roleCoverThreshold = GetRoleEnterCoverThreshold();
+        if (state.health <= roleCoverThreshold)
+        {
+            Debug.Log($"[AI Cooperation] {state.npcId} ({state.role}) is too wounded to rescue '{callerId}' ({state.health:F0} HP <= {roleCoverThreshold:F0}) -> keeping '{state.currentAction}' and asking the AI.");
+        }
+        else if (state.ammo > 0 && state.enemyCount > 0)
+        {
+            // Healthy and armed: immediately move out to rescue the Ally and fire at the Enemy
+            ExecuteAction("ATTACK");
+        }
 
         IncrementStateVersion($"Ally '{callerId}' triggered CALL_FOR_HELP at {callerPosition}");
         decisionTimer = 0f;
@@ -1516,9 +1652,11 @@ public class GuardNPCController : MonoBehaviour
     {
         if (lastManualHelpFrame == Time.frameCount) return;
         lastManualHelpFrame = Time.frameCount;
-        Vector3 helpPos = GetActiveAllyPosition();
-        Debug.Log($"[Cooperation Test] Broadcasting OnCallForHelpTriggered from 'ally_01' at {helpPos}.");
-        OnCallForHelpTriggered?.Invoke("ally_01", helpPos);
+        int callerIdx = GetMostWoundedActiveAllyIndex();
+        Vector3 helpPos = GetAllyPositionOrDefault(callerIdx);
+        string callerId = $"ally_0{callerIdx + 1}";
+        Debug.Log($"[Cooperation Test] Broadcasting OnCallForHelpTriggered from '{callerId}' at {helpPos}.");
+        OnCallForHelpTriggered?.Invoke(callerId, helpPos);
     }
 
     public void ApplyCameraConfiguration()
@@ -1677,9 +1815,9 @@ public class GuardNPCController : MonoBehaviour
                 {
                     r.material.color = new Color(0.22f, 0.68f, 0.92f); // Cyan-blue when Ally is in cover & healing
                 }
-                else if (state.allyNeedsHelp)
+                else if (state.allyNeedsHelp && (distressedAllyIndex < 0 || distressedAllyIndex == i))
                 {
-                    r.material.color = new Color(1.0f, 0.55f, 0.12f); // Bright amber-orange when calling for help
+                    r.material.color = new Color(1.0f, 0.55f, 0.12f); // Bright amber-orange on the Ally calling for help
                 }
                 else
                 {
@@ -1734,13 +1872,17 @@ public class GuardNPCController : MonoBehaviour
         }
         else if (state.allyNeedsHelp != prevAllyNeedsHelp)
         {
+            if (state.allyNeedsHelp)
+            {
+                allyHelpRequestId++;
+            }
             triggerReason = $"Ally help status changed ({prevAllyNeedsHelp} -> {state.allyNeedsHelp})";
         }
         else if (state.coverAvailable != prevCoverAvailable)
         {
             triggerReason = $"Cover availability changed ({prevCoverAvailable} -> {state.coverAvailable})";
         }
-        else if ((prevHealth > 40f && state.health <= 40f) || (prevHealth > 25f && state.health <= 25f))
+        else if ((prevHealth > GetRoleEnterCoverThreshold() && state.health <= GetRoleEnterCoverThreshold()) || (prevHealth > 25f && state.health <= 25f))
         {
             triggerReason = $"Health dropped to critical/low threshold ({prevHealth:F0} -> {state.health:F0})";
         }
@@ -1795,7 +1937,8 @@ public class GuardNPCController : MonoBehaviour
         }
 
         // Can only take cover if cover is available AND the Guard is not already healed up inside the cover pocket
-        bool alreadyHealedInCover = Application.isPlaying && IsPhysicallyInCoverPocket() && state.health >= 70f;
+        float roleExitCoverThreshold = (npcRole == NpcRole.SCOUT) ? GetRoleExitCoverThreshold() : 70f;
+        bool alreadyHealedInCover = Application.isPlaying && IsPhysicallyInCoverPocket() && state.health >= roleExitCoverThreshold;
         if (state.coverAvailable && !alreadyHealedInCover)
         {
             legal.Add("TAKE_COVER");
@@ -1866,6 +2009,8 @@ public class GuardNPCController : MonoBehaviour
         state.role = npcRole.ToString();
         state.stateVersion = requestVersion;
         List<string> legalActionsAtRequest = GenerateLegalActions();
+        // Remember which Ally help call (if any) this request delivers to the LLM
+        int helpIdAtRequest = state.allyNeedsHelp ? allyHelpRequestId : -1;
 
         DecisionRequestPayload payload = new DecisionRequestPayload
         {
@@ -1910,6 +2055,7 @@ public class GuardNPCController : MonoBehaviour
                     fallbackAction
                 );
                 ExecuteAction(fallbackAction);
+                AcknowledgeAllyHelpRequest(helpIdAtRequest);
                 isWaitingForDecision = false;
                 if (pendingDecisionRequest)
                 {
@@ -1936,6 +2082,7 @@ public class GuardNPCController : MonoBehaviour
                     fallbackAction
                 );
                 ExecuteAction(fallbackAction);
+                AcknowledgeAllyHelpRequest(helpIdAtRequest);
                 isWaitingForDecision = false;
                 if (pendingDecisionRequest)
                 {
@@ -1952,8 +2099,24 @@ public class GuardNPCController : MonoBehaviour
             List<string> currentLegalActions = GenerateLegalActions();
             bool isStale = (response.stateVersion != currentStateVersion);
             bool isLegalNow = !string.IsNullOrEmpty(response.action) && currentLegalActions.Contains(response.action);
+            // The LLM chose RELOAD for an empty magazine, but the auto-reload fallback already refilled it while waiting
+            bool reloadAlreadyDone = response.action == "RELOAD" && state.ammo >= maxAmmo;
 
-            if (isStale && !isLegalNow)
+            if (reloadAlreadyDone)
+            {
+                LogDecision(
+                    response.stateVersion,
+                    currentLegalActions,
+                    response.toolsCalled,
+                    response.action,
+                    response.confidence,
+                    response.reason + " [Magazine already refilled by the auto-reload fallback; no extra action needed]",
+                    response.latencyMs,
+                    "ALREADY SATISFIED",
+                    state.currentAction
+                );
+            }
+            else if (isStale && !isLegalNow)
             {
                 string fallback = GetLegalFallbackAction(currentLegalActions);
                 LogDecision(
@@ -2019,6 +2182,7 @@ public class GuardNPCController : MonoBehaviour
             }
         }
 
+        AcknowledgeAllyHelpRequest(helpIdAtRequest);
         isWaitingForDecision = false;
         if (pendingDecisionRequest)
         {
@@ -2072,22 +2236,26 @@ public class GuardNPCController : MonoBehaviour
 
         Vector3 enemyPos = GetNearestActiveEnemyPosition();
 
+        // While an Ally needs help, move to a rescue spot between the distressed Ally and the role's combat zone.
+        // allyNeedsHelp is NOT cleared here; it stays true until the LLM has received it (see AcknowledgeAllyHelpRequest).
+        targetPosition = GetGuardAttackTargetPosition(enemyPos);
         if (state.allyNeedsHelp)
         {
-            // Move out to rescue the distressed existing Ally using role-distinct positioning
-            Vector3 roleCombatPos = GetRoleAttackPosition(enemyPos);
-            Vector3 rescueSpot = Vector3.Lerp(distressedAllyPosition, roleCombatPos, 0.55f);
-            targetPosition = new Vector3(rescueSpot.x, transform.position.y, rescueSpot.z);
-            state.allyNeedsHelp = false;
-            prevAllyNeedsHelp = false;
-            SyncSceneUnitsVisuals();
-            Debug.Log($"[AI Cooperation] {state.npcId} ({state.role}) is moving to rescue Ally at {distressedAllyPosition} ({GetRoleWeaponProfileLabel()})!");
+            string allyLabel = distressedAllyIndex >= 0 ? $"Ally #{distressedAllyIndex + 1}" : "Ally";
+            Debug.Log($"[AI Cooperation] {state.npcId} ({state.role}) is moving to rescue {allyLabel} at {GetDistressedAllyPosition()} ({GetRoleWeaponProfileLabel()})!");
         }
-        else
+    }
+
+    // Role attack zone, or a rescue spot toward the distressed Ally while allyNeedsHelp is active
+    private Vector3 GetGuardAttackTargetPosition(Vector3 enemyPos)
+    {
+        Vector3 roleCombatPos = GetRoleAttackPosition(enemyPos);
+        if (!state.allyNeedsHelp)
         {
-            // Move to the role's distinct tactical attack zone (SCOUT: z=-2.6 strafe, GUARD: z=+0.4 center hold, ASSAULT: z=+3.1 close rush)
-            targetPosition = GetRoleAttackPosition(enemyPos);
+            return roleCombatPos;
         }
+        Vector3 rescueSpot = Vector3.Lerp(GetDistressedAllyPosition(), roleCombatPos, 0.55f);
+        return new Vector3(rescueSpot.x, transform.position.y, rescueSpot.z);
     }
 
     private void TakeCover()
@@ -2111,14 +2279,10 @@ public class GuardNPCController : MonoBehaviour
     {
         SetNpcColor(new Color(0.85f, 0.25f, 0.85f));
 
-        // Do NOT spawn new Allies! Command ONLY the existing Ally in the scene to advance and fire at the Enemy for 8 seconds
-        allySupportMoveTimer = 8.0f;
-
-        if (state.allyNeedsHelp)
-        {
-            state.allyNeedsHelp = false;
-            prevAllyNeedsHelp = false;
-        }
+        // Do NOT spawn new Allies! Command the existing scene Allies to advance next to the Guard and fire faster for 8 seconds
+        // (see supportActive in UpdateExistingAllyMovements). A pending Ally help request is left for the LLM to see.
+        allySupportMoveTimer = AllySupportDuration;
+        allyCombatFireTimer = AllySupportVolleyInterval; // first support volley fires immediately
 
         SyncSceneUnitsVisuals();
 
@@ -2129,7 +2293,7 @@ public class GuardNPCController : MonoBehaviour
         }
 
         Vector3 rallyPos = GetActiveAllyPosition();
-        Debug.Log($"[AI Cooperation] {state.npcId} ({state.role}) executed CALL_FOR_HELP! Existing Ally at {rallyPos} is advancing to assist the Guard!");
+        Debug.Log($"[AI Cooperation] {state.npcId} ({state.role}) executed CALL_FOR_HELP! {state.nearbyAllies} existing Ally unit(s) advancing next to the Guard (rally from {rallyPos}) with rapid support fire for {AllySupportDuration:F0}s!");
         OnCallForHelpTriggered?.Invoke(state.npcId, transform.position);
     }
 
@@ -2258,12 +2422,16 @@ public class GuardNPCController : MonoBehaviour
         state.nearbyAllies = Mathf.Clamp(allies, 0, existingSceneAllies.Count);
         state.coverAvailable = cover;
         state.allyNeedsHelp = false;
+        distressedAllyIndex = -1;
         envContext.objective_under_threat = objectiveThreat;
 
         combatFireDamageTimer = 0f;
         proximityDamageTimer = 0f;
         guardAttackFireTimer = 0f;
+        autoReloadTimer = 0f;
         allyDistressTimer = 0f;
+        allySupportMoveTimer = 0f;
+        allyCombatFireTimer = 0f;
         timeSpentInCover = 0f;
         hasCalledHelpDuringCurrentCover = false;
 
@@ -2291,7 +2459,8 @@ public class GuardNPCController : MonoBehaviour
         }
         else if (ammo == 0)
         {
-            ExecuteAction("RELOAD");
+            // Do NOT reload instantly: the LLM must see ammo=0 and choose RELOAD itself (auto-reload is only a delayed fallback)
+            ExecuteAction("HOLD_POSITION");
         }
         else if (!cover && enemies >= 3)
         {
@@ -2320,6 +2489,7 @@ public class GuardNPCController : MonoBehaviour
         prevAmmo = maxAmmo;
         state.allyNeedsHelp = false;
         prevAllyNeedsHelp = false;
+        distressedAllyIndex = -1;
 
         // 2. Reset Guard Position to initial starting position
         transform.position = initialGuardPosition;
@@ -2444,12 +2614,31 @@ public class GuardNPCController : MonoBehaviour
         string coverShieldText = isProtectedNow ? " [SHIELDED +HEALING]" : "";
 
         EnsureUnitHealthListsSynced();
-        float primaryAllyHp = (state.nearbyAllies > 0 && allyHealths.Count > 0) ? allyHealths[0] : 0f;
-        string allyCoverStatus = state.nearbyAllies <= 0
-            ? "NONE"
-            : ((allyInCoverFlags.Count > 0 && allyInCoverFlags[0] && state.coverAvailable) ? "IN COVER +HEALING" : "ATTACK");
-        float primaryEnemyHp = enemyHealths.Count > 0 ? enemyHealths[0] : 0f;
-        string enemyCoverStatus = (enemyInCoverFlags.Count > 0 && enemyInCoverFlags[0] && state.coverAvailable) ? "IN COVER +HEALING" : "ATTACK";
+
+        // One HUD line per active scene Ally (Scenarios D/E activate 2 Allies)
+        int activeAllies = Mathf.Clamp(state.nearbyAllies, 0, Mathf.Min(existingSceneAllies.Count, allyHealths.Count));
+        StringBuilder allyLines = new StringBuilder();
+        if (activeAllies <= 0)
+        {
+            allyLines.Append("<b>Ally HP:</b> - [NONE]\n");
+        }
+        else
+        {
+            for (int i = 0; i < activeAllies; i++)
+            {
+                allyLines.Append($"<b>Ally #{i + 1} HP:</b> {allyHealths[i]:F0} [{GetAllyHudStatus(i)}]\n");
+            }
+        }
+
+        // All active Enemies on a single line, separated by " | "
+        int activeEnemies = Mathf.Clamp(state.enemyCount, 0, enemyHealths.Count);
+        List<string> enemyParts = new List<string>();
+        for (int i = 0; i < activeEnemies; i++)
+        {
+            enemyParts.Add($"#{i + 1} {enemyHealths[i]:F0}{GetEnemyHudStatus(i, activeEnemies)}");
+        }
+        string enemyLine = enemyParts.Count > 0 ? string.Join(" | ", enemyParts) : "-";
+        string supportText = allySupportMoveTimer > 0f ? $" | <b>Ally Support:</b> {allySupportMoveTimer:F1}s" : "";
 
         return
             "<b>TACTICAL GUARD NPC - DEBUG HUD</b>\n" +
@@ -2457,8 +2646,9 @@ public class GuardNPCController : MonoBehaviour
             $"<b>Scenario:</b> {activeScenarioLabel}\n" +
             $"<b>NPC ID:</b> {state.npcId} | <b>Role:</b> {state.role} ({GetRoleWeaponProfileLabel()})\n" +
             $"<b>Guard HP:</b> {state.health:F0}{coverShieldText} | <b>Ammo:</b> {state.ammo}/{maxAmmo} | <b>StateVer:</b> {currentStateVersion}\n" +
-            $"<b>Ally HP:</b> {primaryAllyHp:F0} [{allyCoverStatus}] | <b>Enemy HP:</b> {primaryEnemyHp:F0} [{enemyCoverStatus}]\n" +
-            $"<b>Enemies:</b> {state.enemyCount} (Dist: {state.enemyDistance:F1}m) | <b>Allies:</b> {state.nearbyAllies}\n" +
+            allyLines.ToString() +
+            $"<b>Enemy HP:</b> {enemyLine}\n" +
+            $"<b>Enemies:</b> {state.enemyCount} (Dist: {state.enemyDistance:F1}m) | <b>Allies:</b> {state.nearbyAllies}{supportText}\n" +
             $"<b>Cover Available:</b> {state.coverAvailable} (Nearest: {envContext.nearest_cover_distance:F1}m)\n" +
             $"<b>Objective Threat:</b> {envContext.objective_under_threat} | <b>Ally Needs Help:</b> {state.allyNeedsHelp}\n" +
             $"<b>Current Action:</b> {state.currentAction}\n\n" +
@@ -2467,6 +2657,42 @@ public class GuardNPCController : MonoBehaviour
             $"<b>MCP Tools:</b> {toolsStr}\n" +
             $"<b>Reason:</b> {lastReason}\n" +
             $"<b>Validation:</b> {lastValidationResult} -> <b>Executed:</b> {lastExecutedAction}";
+    }
+
+    private string GetAllyHudStatus(int index)
+    {
+        bool flaggedForCover = index < allyInCoverFlags.Count && allyInCoverFlags[index] && state.coverAvailable;
+        string status;
+        if (flaggedForCover)
+        {
+            status = IsAllyPhysicallyInCover(index) ? "IN COVER +HEALING" : "MOVING TO COVER";
+        }
+        else
+        {
+            status = (allySupportMoveTimer > 0f && state.enemyCount > 0) ? "SUPPORTING GUARD" : "ATTACK";
+        }
+
+        if (state.allyNeedsHelp && index == distressedAllyIndex)
+        {
+            status += ", NEEDS HELP";
+        }
+        return status;
+    }
+
+    // Enemy status for the single-line HUD: full labels when <= 2 enemies, compact labels when >= 3 so 4 enemies stay on 1 line
+    private string GetEnemyHudStatus(int index, int totalActiveEnemies)
+    {
+        bool flaggedForCover = index < enemyInCoverFlags.Count && enemyInCoverFlags[index] && state.coverAvailable;
+        bool compact = totalActiveEnemies > 2;
+        if (!flaggedForCover)
+        {
+            return compact ? "" : " [ATTACK]";
+        }
+        if (IsEnemyPhysicallyInCover(index))
+        {
+            return compact ? " [HEAL]" : " [IN COVER +HEALING]";
+        }
+        return compact ? " [COVER]" : " [MOVING TO COVER]";
     }
 
     public string GetCurrentRoleLabel()

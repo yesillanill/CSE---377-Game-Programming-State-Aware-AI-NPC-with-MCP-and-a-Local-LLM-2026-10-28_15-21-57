@@ -142,6 +142,9 @@ public static class TacticalSceneSetupEditor
         Text infoText = info.GetComponent<Text>();
         infoText.font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
         infoText.fontSize = 21;
+        infoText.resizeTextForBestFit = true;
+        infoText.resizeTextMinSize = 14;
+        infoText.resizeTextMaxSize = 21;
         infoText.lineSpacing = 1.05f;
         infoText.supportRichText = true;
         infoText.color = new Color(0.93f, 0.96f, 1f);

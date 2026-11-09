@@ -20,10 +20,18 @@ public class GameHUD : MonoBehaviour
     {
         if (guard == null)
         {
-            guard = FindObjectOfType<GuardNPCController>();
+            guard = FindAnyObjectByType<GuardNPCController>();
         }
 
         BindButtons();
+
+        // Scenarios D/E add an extra Ally line; shrink the font automatically instead of truncating the bottom lines
+        if (infoText != null)
+        {
+            infoText.resizeTextForBestFit = true;
+            infoText.resizeTextMinSize = 14;
+            infoText.resizeTextMaxSize = Mathf.Max(14, infoText.fontSize);
+        }
     }
 
     private void Update()
